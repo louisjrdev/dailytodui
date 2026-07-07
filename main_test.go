@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"strings"
 	"testing"
 	"time"
 )
@@ -71,6 +73,114 @@ func TestParseDayInput(t *testing.T) {
 	}
 	if blank.Format(dayLayout) != "2026-05-07" {
 		t.Fatalf("blank = %s", blank.Format(dayLayout))
+	}
+}
+
+func TestCLIAddMultipleTodosWithStatus(t *testing.T) {
+	now := time.Date(2026, time.May, 7, 9, 30, 0, 0, time.UTC)
+	storageDir := t.TempDir()
+	var stdout, stderr bytes.Buffer
+
+	code := runCLI([]string{
+		"add",
+		"--storage-dir", storageDir,
+		"--day", "2026-05-08",
+		"--status", "pending",
+		"--todo", "first task",
+		"--todo", "second task",
+	}, strings.NewReader(""), &stdout, &stderr, now)
+	if code != 0 {
+		t.Fatalf("code = %d, stderr = %s", code, stderr.String())
+	}
+
+	st, err := loadStore(storageDir)
+	if err != nil {
+		t.Fatalf("load store: %v", err)
+	}
+	items := st.Todos["2026-05-08"]
+	if len(items) != 2 {
+		t.Fatalf("len = %d, want 2", len(items))
+	}
+	for _, item := range items {
+		if !item.Pending || item.Completed {
+			t.Fatalf("item status = %#v, want pending", item)
+		}
+		if !item.CreatedAt.Equal(now) {
+			t.Fatalf("created_at = %s, want %s", item.CreatedAt, now)
+		}
+	}
+}
+
+func TestCLICompleteByExactText(t *testing.T) {
+	now := time.Date(2026, time.May, 7, 9, 30, 0, 0, time.UTC)
+	storageDir := t.TempDir()
+	st := store{Todos: map[string][]todoItem{
+		"2026-05-08": {
+			{Text: "open task", CreatedAt: now.Add(-time.Hour)},
+			{Text: "still open", CreatedAt: now.Add(-time.Hour)},
+			{Text: "done task", CreatedAt: now.Add(-time.Hour), Completed: true, DoneAt: now.Add(-time.Minute)},
+		},
+	}}
+	if err := saveStore(storageDir, st); err != nil {
+		t.Fatalf("save store: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+
+	code := runCLI([]string{
+		"complete",
+		"--storage-dir", storageDir,
+		"--day", "2026-05-08",
+		"open task",
+	}, strings.NewReader(""), &stdout, &stderr, now)
+	if code != 0 {
+		t.Fatalf("code = %d, stderr = %s", code, stderr.String())
+	}
+
+	got, err := loadStore(storageDir)
+	if err != nil {
+		t.Fatalf("load store: %v", err)
+	}
+	items := got.Todos["2026-05-08"]
+	if items[0].Text != "still open" || items[1].Text != "open task" || items[2].Text != "done task" {
+		t.Fatalf("completed item was not moved after open items: %#v", items)
+	}
+	if !items[1].Completed || !items[1].DoneAt.Equal(now) {
+		t.Fatalf("completed item = %#v", items[1])
+	}
+}
+
+func TestCLIStatusByIndex(t *testing.T) {
+	now := time.Date(2026, time.May, 7, 9, 30, 0, 0, time.UTC)
+	storageDir := t.TempDir()
+	st := store{Todos: map[string][]todoItem{
+		"2026-05-08": {
+			{Text: "first", CreatedAt: now.Add(-time.Hour)},
+			{Text: "second", CreatedAt: now.Add(-time.Hour)},
+		},
+	}}
+	if err := saveStore(storageDir, st); err != nil {
+		t.Fatalf("save store: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+
+	code := runCLI([]string{
+		"status",
+		"--storage-dir", storageDir,
+		"--day", "2026-05-08",
+		"--index", "2",
+		"pending",
+	}, strings.NewReader(""), &stdout, &stderr, now)
+	if code != 0 {
+		t.Fatalf("code = %d, stderr = %s", code, stderr.String())
+	}
+
+	got, err := loadStore(storageDir)
+	if err != nil {
+		t.Fatalf("load store: %v", err)
+	}
+	items := got.Todos["2026-05-08"]
+	if items[0].Text != "second" || !items[0].Pending {
+		t.Fatalf("pending item should be first: %#v", items)
 	}
 }
 

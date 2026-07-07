@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -51,6 +53,14 @@ type model struct {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] != "tui" {
+		os.Exit(runCLI(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, time.Now()))
+	}
+
+	launchTUI()
+}
+
+func launchTUI() {
 	today := normalizeDay(time.Now())
 	storageDir, err := defaultStorageDir()
 	if err != nil {
@@ -82,6 +92,414 @@ func main() {
 		fmt.Fprintf(os.Stderr, "app error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func runCLI(args []string, stdin io.Reader, stdout, stderr io.Writer, now time.Time) int {
+	if len(args) == 0 {
+		printCLIUsage(stderr)
+		return 2
+	}
+
+	switch args[0] {
+	case "add":
+		return runAddCommand(args[1:], stdin, stdout, stderr, now)
+	case "complete", "done":
+		return runCompleteCommand(args[1:], stdout, stderr, now)
+	case "status":
+		return runStatusCommand(args[1:], stdout, stderr, now)
+	case "list", "ls":
+		return runListCommand(args[1:], stdout, stderr, now)
+	case "help", "-h", "--help":
+		printCLIUsage(stdout)
+		return 0
+	default:
+		fmt.Fprintf(stderr, "unknown command %q\n\n", args[0])
+		printCLIUsage(stderr)
+		return 2
+	}
+}
+
+type repeatStringFlag []string
+
+func (f *repeatStringFlag) String() string {
+	return strings.Join(*f, ",")
+}
+
+func (f *repeatStringFlag) Set(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return errors.New("todo text cannot be empty")
+	}
+	*f = append(*f, value)
+	return nil
+}
+
+func runAddCommand(args []string, stdin io.Reader, stdout, stderr io.Writer, now time.Time) int {
+	fs := cliFlagSet("add", stderr)
+	var storageDir string
+	var dayValue string
+	var statusValue string
+	var todos repeatStringFlag
+	var readStdin bool
+	fs.StringVar(&storageDir, "storage-dir", "", "storage directory (defaults to user config dir)")
+	fs.StringVar(&dayValue, "day", "", "todo day (YYYY-MM-DD, today, tomorrow, yesterday)")
+	fs.StringVar(&statusValue, "status", "open", "initial status: open, pending, completed")
+	fs.Var(&todos, "todo", "todo text; may be repeated")
+	fs.BoolVar(&readStdin, "stdin", false, "read newline-separated todos from stdin")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	texts := append([]string(nil), todos...)
+	if fs.NArg() > 0 {
+		text := strings.TrimSpace(strings.Join(fs.Args(), " "))
+		if text != "" {
+			texts = append(texts, text)
+		}
+	}
+	if readStdin {
+		data, err := io.ReadAll(stdin)
+		if err != nil {
+			fmt.Fprintf(stderr, "read stdin error: %v\n", err)
+			return 1
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if line != "" {
+				texts = append(texts, line)
+			}
+		}
+	}
+	if len(texts) == 0 {
+		fmt.Fprintln(stderr, "add requires todo text, --todo, or --stdin")
+		return 2
+	}
+
+	day, err := parseCLIDay(dayValue, now)
+	if err != nil {
+		fmt.Fprintf(stderr, "day error: %v\n", err)
+		return 2
+	}
+	statusValue, err = normalizeCLIStatus(statusValue)
+	if err != nil {
+		fmt.Fprintf(stderr, "status error: %v\n", err)
+		return 2
+	}
+	storageDir, err = cliStorageDir(storageDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "storage path error: %v\n", err)
+		return 1
+	}
+	st, err := loadStore(storageDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "load error: %v\n", err)
+		return 1
+	}
+
+	items := append([]todoItem(nil), st.Todos[dateKey(day)]...)
+	for _, text := range texts {
+		item := todoItem{Text: text, CreatedAt: now}
+		applyCLIStatus(&item, statusValue, now)
+		items = append(items, item)
+	}
+	setStoreItemsForDay(&st, day, items)
+	if err := saveStore(storageDir, st); err != nil {
+		fmt.Fprintf(stderr, "save error: %v\n", err)
+		return 1
+	}
+
+	fmt.Fprintf(stdout, "Added %d todo(s) for %s.\n", len(texts), dateKey(day))
+	return 0
+}
+
+func runCompleteCommand(args []string, stdout, stderr io.Writer, now time.Time) int {
+	fs := cliFlagSet("complete", stderr)
+	var storageDir string
+	var dayValue string
+	var index int
+	fs.StringVar(&storageDir, "storage-dir", "", "storage directory (defaults to user config dir)")
+	fs.StringVar(&dayValue, "day", "", "todo day (YYYY-MM-DD, today, tomorrow, yesterday)")
+	fs.IntVar(&index, "index", 0, "1-based todo index from list command")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	return runSetStatus(storageDir, dayValue, index, strings.Join(fs.Args(), " "), "completed", stdout, stderr, now)
+}
+
+func runStatusCommand(args []string, stdout, stderr io.Writer, now time.Time) int {
+	fs := cliFlagSet("status", stderr)
+	var storageDir string
+	var dayValue string
+	var index int
+	fs.StringVar(&storageDir, "storage-dir", "", "storage directory (defaults to user config dir)")
+	fs.StringVar(&dayValue, "day", "", "todo day (YYYY-MM-DD, today, tomorrow, yesterday)")
+	fs.IntVar(&index, "index", 0, "1-based todo index from list command")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() == 0 {
+		fmt.Fprintln(stderr, "status requires one of: open, pending, completed")
+		return 2
+	}
+	statusValue, err := normalizeCLIStatus(fs.Arg(0))
+	if err != nil {
+		fmt.Fprintf(stderr, "status error: %v\n", err)
+		return 2
+	}
+	return runSetStatus(storageDir, dayValue, index, strings.Join(fs.Args()[1:], " "), statusValue, stdout, stderr, now)
+}
+
+func runSetStatus(storageDir, dayValue string, index int, text, statusValue string, stdout, stderr io.Writer, now time.Time) int {
+	day, err := parseCLIDay(dayValue, now)
+	if err != nil {
+		fmt.Fprintf(stderr, "day error: %v\n", err)
+		return 2
+	}
+	storageDir, err = cliStorageDir(storageDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "storage path error: %v\n", err)
+		return 1
+	}
+	st, err := loadStore(storageDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "load error: %v\n", err)
+		return 1
+	}
+
+	updated, err := setTodoStatus(&st, day, index, text, statusValue, now)
+	if err != nil {
+		fmt.Fprintf(stderr, "%v\n", err)
+		return 2
+	}
+	if err := saveStore(storageDir, st); err != nil {
+		fmt.Fprintf(stderr, "save error: %v\n", err)
+		return 1
+	}
+
+	fmt.Fprintf(stdout, "Set %q to %s for %s.\n", updated.Text, statusValue, dateKey(day))
+	return 0
+}
+
+func runListCommand(args []string, stdout, stderr io.Writer, now time.Time) int {
+	fs := cliFlagSet("list", stderr)
+	var storageDir string
+	var dayValue string
+	var jsonOutput bool
+	fs.StringVar(&storageDir, "storage-dir", "", "storage directory (defaults to user config dir)")
+	fs.StringVar(&dayValue, "day", "", "todo day (YYYY-MM-DD, today, tomorrow, yesterday)")
+	fs.BoolVar(&jsonOutput, "json", false, "print JSON")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	day, err := parseCLIDay(dayValue, now)
+	if err != nil {
+		fmt.Fprintf(stderr, "day error: %v\n", err)
+		return 2
+	}
+	storageDir, err = cliStorageDir(storageDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "storage path error: %v\n", err)
+		return 1
+	}
+	st, err := loadStore(storageDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "load error: %v\n", err)
+		return 1
+	}
+
+	items := st.Todos[dateKey(day)]
+	if jsonOutput {
+		payload := cliListPayload{Date: dateKey(day), Todos: make([]cliListItem, 0, len(items))}
+		for i, item := range items {
+			var doneAt *time.Time
+			if !item.DoneAt.IsZero() {
+				doneAt = &item.DoneAt
+			}
+			payload.Todos = append(payload.Todos, cliListItem{
+				Index:     i + 1,
+				Text:      item.Text,
+				Status:    itemStatus(item),
+				CreatedAt: item.CreatedAt,
+				DoneAt:    doneAt,
+			})
+		}
+		if err := json.NewEncoder(stdout).Encode(payload); err != nil {
+			fmt.Fprintf(stderr, "json error: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+
+	fmt.Fprintf(stdout, "%s\n", dateKey(day))
+	if len(items) == 0 {
+		fmt.Fprintln(stdout, "No todos.")
+		return 0
+	}
+	for i, item := range items {
+		box := "[ ]"
+		if item.Completed {
+			box = "[x]"
+		} else if item.Pending {
+			box = "[~]"
+		}
+		fmt.Fprintf(stdout, "%d. %s %s\n", i+1, box, item.Text)
+	}
+	return 0
+}
+
+type cliListPayload struct {
+	Date  string        `json:"date"`
+	Todos []cliListItem `json:"todos"`
+}
+
+type cliListItem struct {
+	Index     int        `json:"index"`
+	Text      string     `json:"text"`
+	Status    string     `json:"status"`
+	CreatedAt time.Time  `json:"created_at"`
+	DoneAt    *time.Time `json:"done_at,omitempty"`
+}
+
+func cliFlagSet(name string, stderr io.Writer) *flag.FlagSet {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	return fs
+}
+
+func printCLIUsage(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  dailytodui                      launch the TUI
+  dailytodui tui                  launch the TUI
+  dailytodui add [flags] TEXT     add a todo
+  dailytodui complete [flags] TEXT
+  dailytodui status [flags] STATUS TEXT
+  dailytodui list [flags]
+
+Commands:
+  add       Add one or more todos. Use --todo multiple times or --stdin for bulk adds.
+  complete  Mark a todo completed by exact text or --index.
+  status    Set a todo status: open, pending, completed.
+  list      List todos for a day, with indexes for --index.
+
+Common flags:
+  --day YYYY-MM-DD|today|tomorrow|yesterday
+  --storage-dir PATH`)
+}
+
+func cliStorageDir(value string) (string, error) {
+	if strings.TrimSpace(value) != "" {
+		return value, nil
+	}
+	return defaultStorageDir()
+}
+
+func parseCLIDay(value string, now time.Time) (time.Time, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch value {
+	case "", "today":
+		return normalizeDay(now), nil
+	case "tomorrow":
+		return normalizeDay(now.AddDate(0, 0, 1)), nil
+	case "yesterday":
+		return normalizeDay(now.AddDate(0, 0, -1)), nil
+	default:
+		return parseDayInput(value, now)
+	}
+}
+
+func normalizeCLIStatus(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "open", "todo", "incomplete":
+		return "open", nil
+	case "pending", "in-progress", "progress":
+		return "pending", nil
+	case "completed", "complete", "done":
+		return "completed", nil
+	default:
+		return "", fmt.Errorf("unknown status %q", value)
+	}
+}
+
+func applyCLIStatus(item *todoItem, statusValue string, now time.Time) {
+	switch statusValue {
+	case "completed":
+		item.Pending = false
+		item.Completed = true
+		if item.DoneAt.IsZero() {
+			item.DoneAt = now
+		}
+	case "pending":
+		item.Pending = true
+		item.Completed = false
+		item.DoneAt = time.Time{}
+	default:
+		item.Pending = false
+		item.Completed = false
+		item.DoneAt = time.Time{}
+	}
+}
+
+func setTodoStatus(st *store, day time.Time, index int, text, statusValue string, now time.Time) (todoItem, error) {
+	key := dateKey(day)
+	items := append([]todoItem(nil), st.Todos[key]...)
+	if len(items) == 0 {
+		return todoItem{}, fmt.Errorf("no todos for %s", key)
+	}
+
+	idx, err := findTodoIndex(items, index, text)
+	if err != nil {
+		return todoItem{}, err
+	}
+	applyCLIStatus(&items[idx], statusValue, now)
+	updated := items[idx]
+	setStoreItemsForDay(st, day, items)
+	return updated, nil
+}
+
+func findTodoIndex(items []todoItem, index int, text string) (int, error) {
+	if index < 0 {
+		return 0, fmt.Errorf("index %d out of range", index)
+	}
+	if index > 0 {
+		if index > len(items) {
+			return 0, fmt.Errorf("index %d out of range", index)
+		}
+		return index - 1, nil
+	}
+
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return 0, errors.New("provide exact todo text or --index")
+	}
+
+	matches := []int{}
+	for i, item := range items {
+		if item.Text == text {
+			matches = append(matches, i)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return 0, fmt.Errorf("todo not found: %q", text)
+	case 1:
+		return matches[0], nil
+	default:
+		return 0, fmt.Errorf("multiple todos match %q; use --index", text)
+	}
+}
+
+func setStoreItemsForDay(st *store, day time.Time, items []todoItem) {
+	if st.Todos == nil {
+		st.Todos = map[string][]todoItem{}
+	}
+	key := dateKey(day)
+	items = partitionCompleted(items)
+	if len(items) == 0 {
+		delete(st.Todos, key)
+		return
+	}
+	st.Todos[key] = items
 }
 
 func (m model) Init() tea.Cmd { return nil }
@@ -166,9 +584,15 @@ func (m model) updateInputMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) updateNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "ctrl+c", "q":
+	key := msg.String()
+	if key == "ctrl+c" || key == "q" {
 		return m, tea.Quit
+	}
+	if !m.reloadStore() {
+		return m, nil
+	}
+
+	switch key {
 	case "left", "h":
 		m.day = m.day.AddDate(0, 0, -1)
 		m.clampCursor()
@@ -312,12 +736,40 @@ func (m *model) moveSelected(delta int) {
 }
 
 func (m *model) persist() {
+	latest, err := loadStore(m.storageDir)
+	if err != nil {
+		m.err = err
+		m.status = fmt.Sprintf("Save failed: %v", err)
+		return
+	}
+
+	key := dateKey(m.day)
+	if items, ok := m.store.Todos[key]; ok {
+		latest.Todos[key] = items
+	} else {
+		delete(latest.Todos, key)
+	}
+	m.store = latest
+
 	if err := saveStore(m.storageDir, m.store); err != nil {
 		m.err = err
 		m.status = fmt.Sprintf("Save failed: %v", err)
 		return
 	}
 	m.err = nil
+}
+
+func (m *model) reloadStore() bool {
+	st, err := loadStore(m.storageDir)
+	if err != nil {
+		m.err = err
+		m.status = fmt.Sprintf("Reload failed: %v", err)
+		return false
+	}
+	m.store = st
+	m.clampCursor()
+	m.err = nil
+	return true
 }
 
 func (m *model) itemsForDay() []todoItem {
