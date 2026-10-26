@@ -31,6 +31,8 @@ type todoItem struct {
 	Text      string    `json:"text"`
 	Pending   bool      `json:"pending,omitempty"`
 	Completed bool      `json:"completed"`
+	Cancelled bool      `json:"cancelled,omitempty"`
+	Important bool      `json:"important,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	DoneAt    time.Time `json:"done_at,omitempty"`
 }
@@ -46,6 +48,7 @@ type model struct {
 	mode       inputMode
 	input      textinput.Model
 	storageDir string
+	config     appConfig
 	width      int
 	height     int
 	status     string
@@ -68,10 +71,24 @@ func launchTUI() {
 		os.Exit(1)
 	}
 
+	config, err := loadConfig(storageDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "config error: %v\n", err)
+		os.Exit(1)
+	}
 	st, err := loadStore(storageDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load error: %v\n", err)
 		os.Exit(1)
+	}
+	if changed, err := syncDayFromObsidian(&st, today, config, time.Now()); err != nil {
+		fmt.Fprintf(os.Stderr, "Obsidian sync error: %v\n", err)
+		os.Exit(1)
+	} else if changed {
+		if err := saveStore(storageDir, st); err != nil {
+			fmt.Fprintf(os.Stderr, "save error: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	input := textinput.New()
@@ -83,7 +100,8 @@ func launchTUI() {
 		day:        today,
 		input:      input,
 		storageDir: storageDir,
-		status:     "Left/right switch days. a add. e edit. d delete. r roll over. space toggle. g jump.",
+		config:     config,
+		status:     "Left/right switch days. a add. e edit. d delete. i important. r roll over. p in-progress. c cancel. space complete. g jump.",
 	}
 	m.clampCursor()
 
@@ -109,6 +127,8 @@ func runCLI(args []string, stdin io.Reader, stdout, stderr io.Writer, now time.T
 		return runStatusCommand(args[1:], stdout, stderr, now)
 	case "list", "ls":
 		return runListCommand(args[1:], stdout, stderr, now)
+	case "config":
+		return runConfigCommand(args[1:], stdout, stderr)
 	case "help", "-h", "--help":
 		printCLIUsage(stdout)
 		return 0
@@ -143,7 +163,7 @@ func runAddCommand(args []string, stdin io.Reader, stdout, stderr io.Writer, now
 	var readStdin bool
 	fs.StringVar(&storageDir, "storage-dir", "", "storage directory (defaults to user config dir)")
 	fs.StringVar(&dayValue, "day", "", "todo day (YYYY-MM-DD, today, tomorrow, yesterday)")
-	fs.StringVar(&statusValue, "status", "open", "initial status: open, pending, completed")
+	fs.StringVar(&statusValue, "status", "open", "initial status: open, pending, completed, cancelled")
 	fs.Var(&todos, "todo", "todo text; may be repeated")
 	fs.BoolVar(&readStdin, "stdin", false, "read newline-separated todos from stdin")
 	if err := fs.Parse(args); err != nil {
@@ -190,7 +210,7 @@ func runAddCommand(args []string, stdin io.Reader, stdout, stderr io.Writer, now
 		fmt.Fprintf(stderr, "storage path error: %v\n", err)
 		return 1
 	}
-	st, err := loadStore(storageDir)
+	st, config, err := loadSyncedStore(storageDir, day, now)
 	if err != nil {
 		fmt.Fprintf(stderr, "load error: %v\n", err)
 		return 1
@@ -203,7 +223,7 @@ func runAddCommand(args []string, stdin io.Reader, stdout, stderr io.Writer, now
 		items = append(items, item)
 	}
 	setStoreItemsForDay(&st, day, items)
-	if err := saveStore(storageDir, st); err != nil {
+	if err := saveSyncedStore(storageDir, st, day, config); err != nil {
 		fmt.Fprintf(stderr, "save error: %v\n", err)
 		return 1
 	}
@@ -238,7 +258,7 @@ func runStatusCommand(args []string, stdout, stderr io.Writer, now time.Time) in
 		return 2
 	}
 	if fs.NArg() == 0 {
-		fmt.Fprintln(stderr, "status requires one of: open, pending, completed")
+		fmt.Fprintln(stderr, "status requires one of: open, pending, completed, cancelled")
 		return 2
 	}
 	statusValue, err := normalizeCLIStatus(fs.Arg(0))
@@ -260,7 +280,7 @@ func runSetStatus(storageDir, dayValue string, index int, text, statusValue stri
 		fmt.Fprintf(stderr, "storage path error: %v\n", err)
 		return 1
 	}
-	st, err := loadStore(storageDir)
+	st, config, err := loadSyncedStore(storageDir, day, now)
 	if err != nil {
 		fmt.Fprintf(stderr, "load error: %v\n", err)
 		return 1
@@ -271,7 +291,7 @@ func runSetStatus(storageDir, dayValue string, index int, text, statusValue stri
 		fmt.Fprintf(stderr, "%v\n", err)
 		return 2
 	}
-	if err := saveStore(storageDir, st); err != nil {
+	if err := saveSyncedStore(storageDir, st, day, config); err != nil {
 		fmt.Fprintf(stderr, "save error: %v\n", err)
 		return 1
 	}
@@ -302,7 +322,7 @@ func runListCommand(args []string, stdout, stderr io.Writer, now time.Time) int 
 		fmt.Fprintf(stderr, "storage path error: %v\n", err)
 		return 1
 	}
-	st, err := loadStore(storageDir)
+	st, _, err := loadSyncedStore(storageDir, day, now)
 	if err != nil {
 		fmt.Fprintf(stderr, "load error: %v\n", err)
 		return 1
@@ -320,6 +340,7 @@ func runListCommand(args []string, stdout, stderr io.Writer, now time.Time) int 
 				Index:     i + 1,
 				Text:      item.Text,
 				Status:    itemStatus(item),
+				Important: item.Important,
 				CreatedAt: item.CreatedAt,
 				DoneAt:    doneAt,
 			})
@@ -342,6 +363,8 @@ func runListCommand(args []string, stdout, stderr io.Writer, now time.Time) int 
 			box = "[x]"
 		} else if item.Pending {
 			box = "[~]"
+		} else if item.Cancelled {
+			box = "[-]"
 		}
 		fmt.Fprintf(stdout, "%d. %s %s\n", i+1, box, item.Text)
 	}
@@ -357,6 +380,7 @@ type cliListItem struct {
 	Index     int        `json:"index"`
 	Text      string     `json:"text"`
 	Status    string     `json:"status"`
+	Important bool       `json:"important"`
 	CreatedAt time.Time  `json:"created_at"`
 	DoneAt    *time.Time `json:"done_at,omitempty"`
 }
@@ -375,12 +399,14 @@ func printCLIUsage(w io.Writer) {
   dailytodui complete [flags] TEXT
   dailytodui status [flags] STATUS TEXT
   dailytodui list [flags]
+  dailytodui config [flags]
 
 Commands:
   add       Add one or more todos. Use --todo multiple times or --stdin for bulk adds.
   complete  Mark a todo completed by exact text or --index.
-  status    Set a todo status: open, pending, completed.
+  status    Set a todo status: open, pending, completed, cancelled.
   list      List todos for a day, with indexes for --index.
+  config    View or update configuration. See dailytodui config --help.
 
 Common flags:
   --day YYYY-MM-DD|today|tomorrow|yesterday
@@ -392,6 +418,102 @@ func cliStorageDir(value string) (string, error) {
 		return value, nil
 	}
 	return defaultStorageDir()
+}
+
+func runConfigCommand(args []string, stdout, stderr io.Writer) int {
+	fs := cliFlagSet("config", stderr)
+	var storageDir string
+	var obsidianSync bool
+	var vaultPath string
+	var dailyNotePath string
+	fs.StringVar(&storageDir, "storage-dir", "", "storage directory (defaults to user config dir)")
+	fs.BoolVar(&obsidianSync, "obsidian-sync", false, "enable or disable Obsidian daily-note sync")
+	fs.StringVar(&vaultPath, "obsidian-vault", "", "path to the Obsidian vault")
+	fs.StringVar(&dailyNotePath, "obsidian-daily-note", "", "vault-relative note template containing {date}")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "config does not accept positional arguments")
+		return 2
+	}
+	storageDir, err := cliStorageDir(storageDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "storage path error: %v\n", err)
+		return 1
+	}
+	config, err := loadConfig(storageDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "config error: %v\n", err)
+		return 1
+	}
+
+	updated := false
+	fs.Visit(func(flag *flag.Flag) {
+		switch flag.Name {
+		case "obsidian-sync":
+			config.Obsidian.Enabled = obsidianSync
+			updated = true
+		case "obsidian-vault":
+			config.Obsidian.VaultPath = vaultPath
+			updated = true
+		case "obsidian-daily-note":
+			config.Obsidian.DailyNotePath = dailyNotePath
+			updated = true
+		}
+	})
+	if config.Obsidian.Enabled && strings.TrimSpace(config.Obsidian.VaultPath) == "" {
+		fmt.Fprintln(stderr, "config error: --obsidian-vault is required while Obsidian sync is enabled")
+		return 2
+	}
+	if config.Obsidian.DailyNotePath != "" && !strings.Contains(config.Obsidian.DailyNotePath, "{date}") {
+		fmt.Fprintln(stderr, "config error: --obsidian-daily-note must include {date}")
+		return 2
+	}
+	if updated {
+		if err := saveConfig(storageDir, config); err != nil {
+			fmt.Fprintf(stderr, "config save error: %v\n", err)
+			return 1
+		}
+	}
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		fmt.Fprintf(stderr, "config encode error: %v\n", err)
+		return 1
+	}
+	fmt.Fprintln(stdout, string(data))
+	return 0
+}
+
+func loadSyncedStore(storageDir string, day time.Time, now time.Time) (store, appConfig, error) {
+	config, err := loadConfig(storageDir)
+	if err != nil {
+		return store{}, appConfig{}, err
+	}
+	st, err := loadStore(storageDir)
+	if err != nil {
+		return store{}, appConfig{}, err
+	}
+	changed, err := syncDayFromObsidian(&st, day, config, now)
+	if err != nil {
+		return store{}, appConfig{}, fmt.Errorf("Obsidian sync: %w", err)
+	}
+	if changed {
+		if err := saveStore(storageDir, st); err != nil {
+			return store{}, appConfig{}, err
+		}
+	}
+	return st, config, nil
+}
+
+func saveSyncedStore(storageDir string, st store, day time.Time, config appConfig) error {
+	if err := saveStore(storageDir, st); err != nil {
+		return err
+	}
+	if err := syncDayToObsidian(st, day, config); err != nil {
+		return fmt.Errorf("Obsidian sync: %w", err)
+	}
+	return nil
 }
 
 func parseCLIDay(value string, now time.Time) (time.Time, error) {
@@ -416,6 +538,8 @@ func normalizeCLIStatus(value string) (string, error) {
 		return "pending", nil
 	case "completed", "complete", "done":
 		return "completed", nil
+	case "cancelled", "canceled", "cancel":
+		return "cancelled", nil
 	default:
 		return "", fmt.Errorf("unknown status %q", value)
 	}
@@ -426,16 +550,26 @@ func applyCLIStatus(item *todoItem, statusValue string, now time.Time) {
 	case "completed":
 		item.Pending = false
 		item.Completed = true
+		item.Cancelled = false
+		if item.DoneAt.IsZero() {
+			item.DoneAt = now
+		}
+	case "cancelled":
+		item.Pending = false
+		item.Completed = false
+		item.Cancelled = true
 		if item.DoneAt.IsZero() {
 			item.DoneAt = now
 		}
 	case "pending":
 		item.Pending = true
 		item.Completed = false
+		item.Cancelled = false
 		item.DoneAt = time.Time{}
 	default:
 		item.Pending = false
 		item.Completed = false
+		item.Cancelled = false
 		item.DoneAt = time.Time{}
 	}
 }
@@ -571,7 +705,9 @@ func (m model) updateInputMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.err = nil
 			m.day = day
-			m.clampCursor()
+			if !m.reloadStore() {
+				return m, nil
+			}
 			m.status = fmt.Sprintf("Jumped to %s.", m.day.Format(dayLayout))
 			return m, nil
 		}
@@ -595,11 +731,15 @@ func (m model) updateNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch key {
 	case "left", "h":
 		m.day = m.day.AddDate(0, 0, -1)
-		m.clampCursor()
+		if !m.reloadStore() {
+			return m, nil
+		}
 		m.status = fmt.Sprintf("Viewing %s.", dayLabel(m.day))
 	case "right", "l":
 		m.day = m.day.AddDate(0, 0, 1)
-		m.clampCursor()
+		if !m.reloadStore() {
+			return m, nil
+		}
 		m.status = fmt.Sprintf("Viewing %s.", dayLabel(m.day))
 	case "up", "k":
 		if m.cursor > 0 {
@@ -652,6 +792,7 @@ func (m model) updateNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		items[m.cursor].Completed = !items[m.cursor].Completed
 		if items[m.cursor].Completed {
 			items[m.cursor].Pending = false
+			items[m.cursor].Cancelled = false
 			items[m.cursor].DoneAt = time.Now()
 		} else {
 			items[m.cursor].DoneAt = time.Time{}
@@ -673,6 +814,7 @@ func (m model) updateNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		items[m.cursor].Pending = !items[m.cursor].Pending
 		if items[m.cursor].Pending {
 			items[m.cursor].Completed = false
+			items[m.cursor].Cancelled = false
 			items[m.cursor].DoneAt = time.Time{}
 		}
 		selected = items[m.cursor]
@@ -682,6 +824,28 @@ func (m model) updateNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.clampCursor()
 		m.status = "In-progress toggled."
 		m.persist()
+	case "c":
+		items := m.itemsForDay()
+		if len(items) == 0 {
+			m.status = "No todo selected."
+			break
+		}
+		selected := items[m.cursor]
+		items[m.cursor].Cancelled = !items[m.cursor].Cancelled
+		if items[m.cursor].Cancelled {
+			items[m.cursor].Pending = false
+			items[m.cursor].Completed = false
+			items[m.cursor].DoneAt = time.Now()
+		} else {
+			items[m.cursor].DoneAt = time.Time{}
+		}
+		selected = items[m.cursor]
+		items = partitionCompleted(items)
+		m.setItemsForDay(items)
+		m.cursor = indexOfItem(items, selected)
+		m.clampCursor()
+		m.status = "Todo cancelled toggled."
+		m.persist()
 	case "g":
 		m.mode = modeJump
 		m.input.Placeholder = "YYYY-MM-DD"
@@ -690,8 +854,25 @@ func (m model) updateNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.status = "Jump to date."
 	case "t":
 		m.day = normalizeDay(time.Now())
-		m.clampCursor()
+		if !m.reloadStore() {
+			return m, nil
+		}
 		m.status = "Back to today."
+	case "i":
+		items := m.itemsForDay()
+		if len(items) == 0 {
+			m.status = "No todo selected."
+			break
+		}
+		selected := items[m.cursor]
+		items[m.cursor].Important = !items[m.cursor].Important
+		selected = items[m.cursor]
+		items = partitionCompleted(items)
+		m.setItemsForDay(items)
+		m.cursor = indexOfItem(items, selected)
+		m.clampCursor()
+		m.status = "Todo importance toggled."
+		m.persist()
 	case "r":
 		previousDay, ok := lastNonEmptyDayBefore(m.store.Todos, m.day)
 		if !ok {
@@ -742,6 +923,12 @@ func (m *model) persist() {
 		m.status = fmt.Sprintf("Save failed: %v", err)
 		return
 	}
+	config, err := loadConfig(m.storageDir)
+	if err != nil {
+		m.err = err
+		m.status = fmt.Sprintf("Save failed: %v", err)
+		return
+	}
 
 	key := dateKey(m.day)
 	if items, ok := m.store.Todos[key]; ok {
@@ -750,8 +937,9 @@ func (m *model) persist() {
 		delete(latest.Todos, key)
 	}
 	m.store = latest
+	m.config = config
 
-	if err := saveStore(m.storageDir, m.store); err != nil {
+	if err := saveSyncedStore(m.storageDir, m.store, m.day, m.config); err != nil {
 		m.err = err
 		m.status = fmt.Sprintf("Save failed: %v", err)
 		return
@@ -760,13 +948,14 @@ func (m *model) persist() {
 }
 
 func (m *model) reloadStore() bool {
-	st, err := loadStore(m.storageDir)
+	st, config, err := loadSyncedStore(m.storageDir, m.day, time.Now())
 	if err != nil {
 		m.err = err
 		m.status = fmt.Sprintf("Reload failed: %v", err)
 		return false
 	}
 	m.store = st
+	m.config = config
 	m.clampCursor()
 	m.err = nil
 	return true
@@ -819,20 +1008,26 @@ func (m model) View() string {
 			if i == m.cursor {
 				cursor = "> "
 			}
+			style := lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
 			box := "[ ]"
-			text := item.Text
 			if item.Completed {
+				style = style.Foreground(lipgloss.Color("10")).Strikethrough(true)
 				box = "[x]"
-				text = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Strikethrough(true).Render(text)
 			} else if item.Pending {
+				style = style.Foreground(lipgloss.Color("11"))
 				box = "[~]"
-				text = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Render(text)
+			} else if item.Cancelled {
+				style = style.Foreground(lipgloss.Color("8"))
+				box = "[-]"
 			}
-			lines = append(lines, cursor+box+" "+text)
+			if item.Important {
+				style = style.Foreground(lipgloss.Color("9"))
+			}
+			lines = append(lines, cursor+style.Render(box+" "+item.Text))
 		}
 	}
 
-	help := lipgloss.NewStyle().Foreground(lipgloss.Color("12")).Render("h/left prev  l/right next  j/k move  shift+up/down reorder  a add  e edit  d delete  r roll over  p in-progress  space complete  g goto  t today  q quit")
+	help := lipgloss.NewStyle().Foreground(lipgloss.Color("12")).Render("h/left prev  l/right next  j/k move  shift+up/down reorder  a add  e edit  d delete  i important  r roll over  p in-progress  c cancel  space complete  g goto  t today  q quit")
 
 	body := strings.Join(lines, "\n")
 	if m.mode == modeAdd || m.mode == modeEdit || m.mode == modeJump {
@@ -929,7 +1124,7 @@ func rolloverIncompleteTodos(target, source []todoItem, now time.Time) ([]todoIt
 
 	added := 0
 	for _, item := range source {
-		if item.Completed {
+		if item.Completed || item.Cancelled {
 			continue
 		}
 		if _, ok := existing[item.Text]; ok {
@@ -951,12 +1146,22 @@ func partitionCompleted(items []todoItem) []todoItem {
 	if len(items) < 2 {
 		return append([]todoItem(nil), items...)
 	}
+	important := make([]todoItem, 0, len(items))
 	pending := make([]todoItem, 0, len(items))
 	open := make([]todoItem, 0, len(items))
-	done := make([]todoItem, 0, len(items))
+	completed := make([]todoItem, 0, len(items))
+	cancelled := make([]todoItem, 0, len(items))
 	for _, item := range items {
+		if item.Important {
+			important = append(important, item)
+			continue
+		}
 		if item.Completed {
-			done = append(done, item)
+			completed = append(completed, item)
+			continue
+		}
+		if item.Cancelled {
+			cancelled = append(cancelled, item)
 			continue
 		}
 		if item.Pending {
@@ -965,7 +1170,7 @@ func partitionCompleted(items []todoItem) []todoItem {
 		}
 		open = append(open, item)
 	}
-	return append(append(pending, open...), done...)
+	return append(append(append(append(important, pending...), open...), completed...), cancelled...)
 }
 
 func moveItemWithinSection(items []todoItem, idx, delta int) ([]todoItem, int) {
@@ -983,20 +1188,30 @@ func moveItemWithinSection(items []todoItem, idx, delta int) ([]todoItem, int) {
 }
 
 func sectionBounds(items []todoItem, idx int) (int, int) {
-	status := itemStatus(items[idx])
+	section := itemSection(items[idx])
 	start, end := idx, idx
-	for start > 0 && itemStatus(items[start-1]) == status {
+	for start > 0 && itemSection(items[start-1]) == section {
 		start--
 	}
-	for end < len(items)-1 && itemStatus(items[end+1]) == status {
+	for end < len(items)-1 && itemSection(items[end+1]) == section {
 		end++
 	}
 	return start, end
 }
 
+func itemSection(item todoItem) string {
+	if item.Important {
+		return "important"
+	}
+	return itemStatus(item)
+}
+
 func itemStatus(item todoItem) string {
 	if item.Completed {
 		return "completed"
+	}
+	if item.Cancelled {
+		return "cancelled"
 	}
 	if item.Pending {
 		return "pending"
@@ -1006,7 +1221,7 @@ func itemStatus(item todoItem) string {
 
 func indexOfItem(items []todoItem, target todoItem) int {
 	for i, item := range items {
-		if item.Text == target.Text && item.Completed == target.Completed && item.CreatedAt.Equal(target.CreatedAt) {
+		if item.Text == target.Text && item.Pending == target.Pending && item.Completed == target.Completed && item.Cancelled == target.Cancelled && item.Important == target.Important && item.CreatedAt.Equal(target.CreatedAt) {
 			return i
 		}
 	}
